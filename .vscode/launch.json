@@ -1,0 +1,173 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Benchmark Client",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [
+        "0.0.0.0",
+        "5555",
+        "-v"
+      ],
+      "stopAtEntry": true,
+      "externalConsole": false,
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/rp-benchmark",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "setupCommands": [
+        {
+          "description": "Skip pthread and system files",
+          "text": "skip -gfi */pthread_*.c",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Skip clone implementation files",
+          "text": "skip -gfi */clone*.S",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Skip all sysdeps files",
+          "text": "skip -gfi */sysdeps/*",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Enable pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Client",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [
+        "localhost",
+        "5555",
+        "interactive"
+      ],
+      "stopAtEntry": true,
+      "externalConsole": false,
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/rp-client",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "setupCommands": [
+        {
+          "description": "Skip pthread and system files",
+          "text": "skip -gfi */pthread_*.c",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Skip clone implementation files",
+          "text": "skip -gfi */clone*.S",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Skip all sysdeps files",
+          "text": "skip -gfi */sysdeps/*",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Enable pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Server",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [
+        "5555"
+      ],
+      "stopAtEntry": true,
+      "externalConsole": false,
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/rp-server",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "setupCommands": [
+        {
+          "description": "Skip pthread and system files",
+          "text": "skip -gfi */pthread_*.c",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Skip clone implementation files",
+          "text": "skip -gfi */clone*.S",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Skip all sysdeps files",
+          "text": "skip -gfi */sysdeps/*",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Enable pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Server Unix SOCKET",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [
+        "/tmp/qemu-rp.sock",
+        "--unix"
+      ],
+      "stopAtEntry": true,
+      "externalConsole": false,
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/rp-server",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "setupCommands": [
+        {
+          "description": "Skip pthread and system files",
+          "text": "skip -gfi */pthread_*.c",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Skip clone implementation files",
+          "text": "skip -gfi */clone*.S",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Skip all sysdeps files",
+          "text": "skip -gfi */sysdeps/*",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Enable pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [],
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/build/Debug/outDebug",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}
