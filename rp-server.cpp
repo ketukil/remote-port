@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <pthread.h>
+#include <termios.h>
 extern "C" {
 #include "remote-port-proto.h"
 #include "remote-port-sk.h"
@@ -42,6 +43,8 @@ uint32_t next_id = 0;
 pthread_mutex_t id_mutex = PTHREAD_MUTEX_INITIALIZER;
 int using_unix_socket = 0;
 char unix_socket_path[PATH_MAX] = { 0 };
+volatile int keyboard_monitoring =
+	1; // Flag to control keyboard monitoring thread
 
 struct client_state {
 	int fd;
@@ -53,10 +56,45 @@ struct client_state {
 
 struct client_state clients[MAX_CLIENTS];
 
+// Original terminal settings
+struct termios orig_termios;
+
+// Set terminal to raw mode
+void set_raw_mode()
+{
+	struct termios raw;
+
+	// Save original terminal settings
+	tcgetattr(STDIN_FILENO, &orig_termios);
+
+	// Set terminal to raw mode
+	raw = orig_termios;
+	raw.c_lflag &= ~(ECHO | ICANON);
+	raw.c_cc[VMIN] = 0; // Return immediately with whatever is available
+	raw.c_cc[VTIME] = 0; // No timeout
+
+	tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+
+	// Set stdin to non-blocking
+	fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
+}
+
+// Restore original terminal settings
+void restore_terminal()
+{
+	tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+}
+
 // Signal handler for clean shutdown
 void handle_signal(int sig)
 {
 	printf("\nReceived signal %d, shutting down...\n", sig);
+
+	// Stop keyboard monitoring
+	keyboard_monitoring = 0;
+
+	// Restore terminal settings
+	restore_terminal();
 
 	// Close server socket
 	if (server_fd >= 0) {
@@ -115,6 +153,7 @@ bool is_packed_valid(struct rp_pkt *pkt)
 
 	return true;
 }
+
 // Send HELLO message to client
 void send_hello(int client_fd)
 {
@@ -214,6 +253,39 @@ void handle_interrupt(int client_fd, struct rp_pkt *pkt)
 	}
 }
 
+// Send an interrupt to all connected clients
+void send_interrupt_to_clients(uint32_t line, uint64_t vector, uint8_t val)
+{
+	struct rp_pkt_interrupt pkt;
+	size_t len;
+	struct timespec ts;
+	int64_t timestamp;
+	int clients_sent = 0;
+
+	// Get current timestamp
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	timestamp = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+	// Send interrupt to all connected clients
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		if (clients[i].connected) {
+			len = rp_encode_interrupt(get_next_id(),
+						  clients[i].dev_id, &pkt,
+						  timestamp, line, vector, val);
+
+			rp_safe_write(clients[i].fd, &pkt, len);
+			clients_sent++;
+		}
+	}
+
+	if (clients_sent > 0) {
+		printf("Sent manual interrupt to %d clients (line=%u, val=%u)\n",
+		       clients_sent, line, val);
+	} else {
+		printf("No clients connected to receive interrupt\n");
+	}
+}
+
 // Handle Read command
 void handle_read(int client_fd, struct rp_pkt *pkt)
 {
@@ -281,6 +353,7 @@ void handle_read(int client_fd, struct rp_pkt *pkt)
 	// Free allocated memory
 	rp_dpkt_free(&dpkt);
 }
+
 // Handle Write command
 void handle_write(int client_fd, struct rp_pkt *pkt, uint8_t *data, size_t len)
 {
@@ -508,6 +581,45 @@ void *client_handler(void *arg)
 	return NULL;
 }
 
+// Keyboard monitoring thread function
+void *keyboard_monitor_thread(void *arg)
+{
+	char c;
+
+	printf("Keyboard monitor started. Press 'i' to send an interrupt to all clients.\n");
+	printf("Press 'q' to quit.\n");
+
+	while (keyboard_monitoring) {
+		// Check for key press
+		if (read(STDIN_FILENO, &c, 1) > 0) {
+			switch (c) {
+			case 'i':
+			case 'I':
+				// Send interrupt with line 1, vector 0, value 1
+				send_interrupt_to_clients(1, 0, 1);
+				break;
+
+			case 'q':
+			case 'Q':
+				// Trigger graceful shutdown
+				printf("Quit requested via keyboard\n");
+				keyboard_monitoring = 0;
+				kill(getpid(), SIGINT);
+				return NULL;
+
+			default:
+				// Ignore other keys
+				break;
+			}
+		}
+
+		// Sleep a bit to avoid consuming too much CPU
+		usleep(50000); // 50ms
+	}
+
+	return NULL;
+}
+
 // Set up TCP socket server
 int setup_tcp_server(int port)
 {
@@ -611,6 +723,7 @@ int main(int argc, char *argv[])
 	struct sockaddr *client_addr;
 	socklen_t client_len;
 	int client_fd;
+	pthread_t keyboard_thread;
 
 	// Initialize client array
 	for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -637,12 +750,23 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	// Set terminal to raw mode for keyboard input
+	set_raw_mode();
+
 	// Set up signal handlers
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 
 	// Initialize peer state
 	memset(&peer_state, 0, sizeof(peer_state));
+
+	// Start keyboard monitoring thread
+	if (pthread_create(&keyboard_thread, NULL, keyboard_monitor_thread,
+			   NULL) != 0) {
+		perror("Failed to create keyboard monitoring thread");
+		restore_terminal();
+		return 1;
+	}
 
 	// Set up server socket
 	if (using_unix_socket) {
@@ -664,9 +788,42 @@ int main(int argc, char *argv[])
 	}
 
 	printf("Remote-Port server listening...\n");
+	printf("Press 'i' to send an interrupt to all clients. Press 'q' to quit.\n");
 
 	// Main server loop
-	while (1) {
+	while (keyboard_monitoring) {
+		// Set up the file descriptors for select
+		fd_set readfds;
+		struct timeval tv;
+
+		FD_ZERO(&readfds);
+		FD_SET(server_fd, &readfds);
+
+		// Use a short timeout to allow for checking keyboard_monitoring flag
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+
+		int select_result =
+			select(server_fd + 1, &readfds, NULL, NULL, &tv);
+
+		if (select_result < 0) {
+			if (errno == EINTR) {
+				continue; // Interrupted by signal, just continue
+			}
+			perror("select");
+			break;
+		}
+
+		if (select_result == 0) {
+			// Timeout - just continue to check the keyboard_monitoring flag
+			continue;
+		}
+
+		if (!FD_ISSET(server_fd, &readfds)) {
+			continue;
+		}
+
+		// Accept a new client connection
 		client_fd = accept(server_fd, client_addr, &client_len);
 		if (client_fd < 0) {
 			perror("accept");
@@ -708,6 +865,32 @@ int main(int argc, char *argv[])
 				pthread_detach(clients[i].thread);
 			}
 		}
+	}
+
+	// Wait for keyboard monitoring thread to finish
+	keyboard_monitoring = 0;
+	pthread_join(keyboard_thread, NULL);
+
+	// Restore terminal settings
+	restore_terminal();
+
+	// Close server socket
+	if (server_fd >= 0) {
+		close(server_fd);
+	}
+
+	// Clean up client connections
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		if (clients[i].connected) {
+			close(clients[i].fd);
+			clients[i].connected = 0;
+		}
+	}
+
+	// Remove unix socket file if we were using one
+	if (using_unix_socket && unix_socket_path[0] != '\0') {
+		unlink(unix_socket_path);
+		printf("Removed Unix socket: %s\n", unix_socket_path);
 	}
 
 	return 0;
