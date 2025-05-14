@@ -27,7 +27,12 @@ extern "C" {
 #include "remote-port-proto.h"
 #include "safeio.h"
 }
-#define BUFFER_SIZE 4096
+
+#define _kiB (1ULL << 10)
+#define _MiB (1ULL << 20)
+#define _GiB (1ULL << 30)
+
+#define BUFFER_SIZE 2 * _MiB
 #define DEFAULT_UNIX_SOCKET "/tmp/rp-server.sock"
 
 // Global variables
@@ -153,7 +158,8 @@ void send_read(uint64_t addr, uint32_t size)
 
 	printf("[client] Sending READ: addr=0x%lx, size=%u\n", addr, size);
 
-	len = rp_encode_read(RP_CMD_read, 0, &pkt, timestamp, 0, addr, 0, size, 0, size);
+	len = rp_encode_read(RP_CMD_read, 0, &pkt, timestamp, 0, addr, 0, size,
+			     0, size);
 	rp_safe_write(socket_fd, &pkt, len);
 }
 
@@ -177,10 +183,11 @@ void send_write(uint64_t addr, const char *data_hex)
 		sscanf(data_hex + i * 2, "%2hhx", &data[i]);
 	}
 
-	printf("[client] Sending WRITE: addr=0x%lx, size=%zu\n", addr, data_len);
+	printf("[client] Sending WRITE: addr=0x%lx, size=%zu\n", addr,
+	       data_len);
 
-	len = rp_encode_write(RP_CMD_write, 0, &pkt, timestamp, 0, addr, 0, data_len, 0,
-			      data_len);
+	len = rp_encode_write(RP_CMD_write, 0, &pkt, timestamp, 0, addr, 0,
+			      data_len, 0, data_len);
 	rp_safe_write(socket_fd, &pkt, len);
 	rp_safe_write(socket_fd, data, data_len);
 
@@ -223,6 +230,16 @@ void *receive_thread_func(void *arg)
 
 		// Read rest of packet
 		if (pkt->hdr.len > 0) {
+			// Ensure we don't overflow the buffer
+			if (sizeof(pkt->hdr) + pkt->hdr.len > BUFFER_SIZE) {
+				fprintf(stderr,
+					"[client] ERROR: Packet too large for buffer: %u bytes\n",
+					(unsigned int)(sizeof(pkt->hdr) +
+						       pkt->hdr.len));
+				running = 0;
+				break;
+			}
+
 			r = read(socket_fd, buffer + sizeof(pkt->hdr),
 				 pkt->hdr.len);
 			if (r <= 0) {
@@ -265,15 +282,76 @@ void *receive_thread_func(void *arg)
 		case RP_CMD_read:
 			printf("[client] Received READ: addr=0x%lx, len=%u\n",
 			       pkt->busaccess.addr, pkt->busaccess.len);
+
+			// For read responses, we need to read the actual data
+			if (pkt->busaccess.len > 0) {
+				uint8_t data_buffer[BUFFER_SIZE];
+				uint32_t data_len = pkt->busaccess.len;
+
+				// Ensure we don't overflow the data buffer
+				if (data_len > BUFFER_SIZE) {
+					fprintf(stderr,
+						"[client] ERROR: Data too large for buffer: %u bytes\n",
+						data_len);
+					data_len = BUFFER_SIZE;
+				}
+
+				// Read the data payload
+				r = read(socket_fd, data_buffer, data_len);
+				if (r <= 0) {
+					if (r < 0)
+						perror("read");
+					printf("[client] Server disconnected during data read\n");
+					running = 0;
+					break;
+				}
+
+				printf("[client] Received data: ");
+				for (uint32_t i = 0; i < data_len && i <= 1024;
+				     i++) {
+					printf("%02x ", data_buffer[i]);
+				}
+				if (data_len > 1024) {
+					printf("... (%u bytes total)\n",
+					       data_len);
+				} else {
+					printf("\n");
+				}
+			}
 			break;
 
 		case RP_CMD_write:
 			printf("[client] Received WRITE: addr=0x%lx, len=%u\n",
 			       pkt->busaccess.addr, pkt->busaccess.len);
+
+			// For write commands from server to client, we may need to read data as well
+			if (pkt->busaccess.len > 0) {
+				uint8_t data_buffer[BUFFER_SIZE];
+				uint32_t data_len = pkt->busaccess.len;
+
+				// Ensure we don't overflow the data buffer
+				if (data_len > BUFFER_SIZE) {
+					fprintf(stderr,
+						"[client] ERROR: Data too large for buffer: %u bytes\n",
+						data_len);
+					data_len = BUFFER_SIZE;
+				}
+
+				// Read the data payload
+				r = read(socket_fd, data_buffer, data_len);
+				if (r <= 0) {
+					if (r < 0)
+						perror("read");
+					printf("[client] Server disconnected during data read\n");
+					running = 0;
+					break;
+				}
+			}
 			break;
 
 		default:
-			printf("[client] Received unknown command: %d\n", pkt->hdr.cmd);
+			printf("[client] Received unknown command: %d\n",
+			       pkt->hdr.cmd);
 			break;
 		}
 	}
@@ -413,7 +491,8 @@ int main(int argc, char *argv[])
 
 	// Connect to server
 	if (using_unix_socket) {
-		printf("[client] Connecting to Unix socket: %s\n", unix_socket_path);
+		printf("[client] Connecting to Unix socket: %s\n",
+		       unix_socket_path);
 		socket_fd = connect_unix_server(unix_socket_path);
 	} else {
 		printf("[client] Connecting to %s:%d\n", host, port);
