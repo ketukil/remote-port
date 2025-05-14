@@ -40,7 +40,7 @@
       ]
     },
     {
-      "name": "Client",
+      "name": "Client TCP",
       "type": "cppdbg",
       "request": "launch",
       "args": [
