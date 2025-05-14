@@ -5,7 +5,7 @@
  * Start two instances of this server to exchange information.
  * Clients can connect using netcat.
  *
- * Usage: ./rp-server <port|unix-socket-path> [--unix]
+ * Usage: ./rp-server <port|unix-socket-path> [--unix] [--base <addr>] [--size <size>] [--fill <min>:<max>]
  */
 
 #include <stdio.h>
@@ -24,6 +24,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <termios.h>
+#include <ctype.h>
 extern "C" {
 #include "remote-port-proto.h"
 #include "remote-port-sk.h"
@@ -35,16 +36,27 @@ extern "C" {
 #define BUFFER_SIZE 64 * 1024
 #define MAX_CLIENTS 10
 #define PATH_MAX 1024
+#define DEFAULT_BUFFER_SIZE 0x100
+#define DEFAULT_BUFFER_BASE 0x3f800000
 
 // Global variables
 volatile int server_fd = -1;
 struct rp_peer_state peer_state;
 uint32_t next_id = 0;
 pthread_mutex_t id_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
 int using_unix_socket = 0;
 char unix_socket_path[PATH_MAX] = { 0 };
 volatile int keyboard_monitoring =
 	1; // Flag to control keyboard monitoring thread
+
+// Buffer-related globals
+uint8_t *memory_buffer = NULL;
+uint64_t buffer_base_addr = DEFAULT_BUFFER_BASE;
+size_t buffer_size = DEFAULT_BUFFER_SIZE;
+uint16_t fill_min = 0;
+uint16_t fill_max = 0;
+int custom_fill = 0;
 
 struct client_state {
 	int fd;
@@ -85,6 +97,74 @@ void restore_terminal()
 	tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
 }
 
+// Parse a hex string to uint64_t
+uint64_t parse_hex_arg(const char *str)
+{
+	uint64_t value;
+	if (strncmp(str, "0x", 2) == 0 || strncmp(str, "0X", 2) == 0) {
+		// Skip 0x prefix
+		if (sscanf(str + 2, "%lx", &value) != 1) {
+			fprintf(stderr, "Error parsing hex value: %s\n", str);
+			return 0;
+		}
+	} else {
+		// Try parsing as hex
+		if (sscanf(str, "%lx", &value) != 1) {
+			// If that fails, try parsing as decimal
+			if (sscanf(str, "%lu", &value) != 1) {
+				fprintf(stderr,
+					"Error parsing numeric value: %s\n",
+					str);
+				return 0;
+			}
+		}
+	}
+	return value;
+}
+
+// Initialize memory buffer
+void init_memory_buffer()
+{
+	// Allocate memory for the buffer
+	memory_buffer = (uint8_t *)malloc(buffer_size);
+	if (!memory_buffer) {
+		fprintf(stderr,
+			"Failed to allocate memory buffer of size 0x%zx\n",
+			buffer_size);
+		exit(1);
+	}
+
+	// Initialize buffer with values
+	if (custom_fill) {
+		srand(time(NULL));
+		uint16_t range = fill_max - fill_min + 1;
+		for (size_t i = 0; i < buffer_size; i++) {
+			uint16_t value = fill_min + (rand() % range);
+			memory_buffer[i] = value & 0xFF;
+		}
+		printf("Buffer initialized with values between 0x%02x and 0x%02x\n",
+		       fill_min, fill_max);
+	} else {
+		// Fill with incrementing values from 0x00 to 0xFF and wrap around
+		for (size_t i = 0; i < buffer_size; i++) {
+			memory_buffer[i] = i & 0xFF;
+		}
+		printf("Buffer initialized with incrementing values from 0x00 to 0xFF\n");
+	}
+
+	printf("Memory buffer allocated: base=0x%lx, size=0x%zx\n",
+	       buffer_base_addr, buffer_size);
+}
+
+// Clean up memory buffer
+void cleanup_memory_buffer()
+{
+	if (memory_buffer) {
+		free(memory_buffer);
+		memory_buffer = NULL;
+	}
+}
+
 // Signal handler for clean shutdown
 void handle_signal(int sig)
 {
@@ -114,6 +194,9 @@ void handle_signal(int sig)
 		unlink(unix_socket_path);
 		printf("Removed Unix socket: %s\n", unix_socket_path);
 	}
+
+	// Clean up memory buffer
+	cleanup_memory_buffer();
 
 	exit(0);
 }
@@ -186,7 +269,7 @@ void process_hello(int client_fd, struct rp_pkt *pkt)
 		return;
 	}
 
-	printf("Received valid HELLO packet (version %d.%d)\n",
+	printf("\nReceived valid HELLO packet (version %d.%d)\n",
 	       pkt->hello.version.major, pkt->hello.version.minor);
 
 	if (pkt->hello.caps.len) {
@@ -227,7 +310,7 @@ void handle_interrupt(int client_fd, struct rp_pkt *pkt)
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	timestamp = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 
-	printf("Received interrupt: line=%u, val=%u\n", pkt->interrupt.line,
+	printf("\nReceived interrupt: line=%u, val=%u\n", pkt->interrupt.line,
 	       pkt->interrupt.val);
 
 	// Only send response if not posted
@@ -286,7 +369,7 @@ void send_interrupt_to_clients(uint32_t line, uint64_t vector, uint8_t val)
 	}
 }
 
-// Handle Read command
+// Handle Read command - modified to use memory buffer
 void handle_read(int client_fd, struct rp_pkt *pkt)
 {
 	size_t plen;
@@ -300,24 +383,53 @@ void handle_read(int client_fd, struct rp_pkt *pkt)
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	timestamp = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 
-	printf("Received read: addr=0x%lx, len=%u\n", pkt->busaccess.addr,
+	printf("\nReceived read: addr=0x%lx, len=%u\n", pkt->busaccess.addr,
 	       pkt->busaccess.len);
 
 	// Initialize response parameters
 	rp_encode_busaccess_in_rsp_init(&in, pkt);
 	in.clk = timestamp;
-	in.attr |= RP_RESP_OK << RP_BUS_RESP_SHIFT;
+
+	// Check if address is in our buffer range
+	uint64_t read_addr = pkt->busaccess.addr;
+	uint32_t read_len = pkt->busaccess.len;
+	uint32_t data_size = read_len;
+
+	// Lock buffer mutex for thread safety
+	pthread_mutex_lock(&buffer_mutex);
+
+	if (read_addr >= buffer_base_addr &&
+	    read_addr < buffer_base_addr + buffer_size) {
+		// Calculate offset into our buffer
+		uint64_t offset = read_addr - buffer_base_addr;
+
+		// Check if requested length would go beyond buffer end
+		if (offset + read_len > buffer_size) {
+			printf("Warning: Read extends beyond buffer end. Truncating.\n");
+			data_size = buffer_size - offset;
+		}
+
+		// Set response status to OK
+		in.attr |= RP_RESP_OK << RP_BUS_RESP_SHIFT;
+	} else {
+		// Address out of range
+		printf("Warning: Read address 0x%lx is outside buffer range (0x%lx-0x%lx)\n",
+		       read_addr, buffer_base_addr,
+		       buffer_base_addr + buffer_size - 1);
+		in.attr |= RP_RESP_ADDR_ERROR << RP_BUS_RESP_SHIFT;
+		data_size = 0;
+	}
 
 	// Ensure we're not allocating more space than we can handle
-	uint32_t data_size = pkt->busaccess.len;
 	if (data_size >
 	    BUFFER_SIZE - sizeof(struct rp_pkt_busaccess_ext_base)) {
 		fprintf(stderr,
 			"Warning: Requested read size too large, truncating\n");
 		data_size =
 			BUFFER_SIZE - sizeof(struct rp_pkt_busaccess_ext_base);
-		in.size = data_size; // Update size in response
 	}
+
+	in.size = data_size; // Update size in response
 
 	// Allocate space for the response
 	rp_dpkt_alloc(&dpkt,
@@ -327,14 +439,28 @@ void handle_read(int client_fd, struct rp_pkt *pkt)
 	plen = rp_encode_busaccess(&peer_state, &dpkt.pkt->busaccess_ext_base,
 				   &in);
 
-	// Generate some demo data (incrementing values)
+	// Set up data pointer
 	data = rp_busaccess_tx_dataptr(&peer_state,
 				       &dpkt.pkt->busaccess_ext_base);
-	if (data) {
-		for (unsigned int i = 0; i < data_size; i++) {
-			data[i] = i & 0xFF;
+
+	// Copy data from our buffer if the address was valid
+	if (data && data_size > 0 && read_addr >= buffer_base_addr &&
+	    read_addr < buffer_base_addr + buffer_size) {
+		uint64_t offset = read_addr - buffer_base_addr;
+		memcpy(data, memory_buffer + offset, data_size);
+
+		// Print first few bytes for debugging
+		printf("Data: ");
+		for (unsigned int i = 0; i < data_size && i <= 1024; i++) {
+			printf("%02x ", data[i]);
 		}
+		if (data_size > 1024)
+			printf("...");
+		printf("\n");
 	}
+
+	// Unlock buffer mutex
+	pthread_mutex_unlock(&buffer_mutex);
 
 	// Send the response header
 	if (rp_safe_write(client_fd, dpkt.pkt, plen) != plen) {
@@ -354,29 +480,64 @@ void handle_read(int client_fd, struct rp_pkt *pkt)
 	rp_dpkt_free(&dpkt);
 }
 
-// Handle Write command
+// Handle Write command - modified to update memory buffer
 void handle_write(int client_fd, struct rp_pkt *pkt, uint8_t *data, size_t len)
 {
 	struct rp_pkt_busaccess resp = { 0 };
 	int64_t timestamp;
 	struct timespec ts;
 	struct rp_encode_busaccess_in in = { 0 };
+	int write_result = RP_RESP_OK;
 
 	// Get current timestamp
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	timestamp = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 
-	printf("Received write: addr=0x%lx, len=%u\n", pkt->busaccess.addr,
+	printf("\nReceived write: addr=0x%lx, len=%u\n", pkt->busaccess.addr,
 	       pkt->busaccess.len);
 
 	// Print the data (for demo purposes)
 	printf("Data: ");
-	for (size_t i = 0; i < len && i < 16; i++) {
+	for (size_t i = 0; i < len && i <= 1024; i++) {
 		printf("%02x ", data[i]);
 	}
-	if (len > 16)
-		printf("...");
+	if (len > 1024) {
+		printf("... (%u bytes total)\n", len);
+	}
 	printf("\n");
+
+	// Check if address is in our buffer range and update buffer
+	uint64_t write_addr = pkt->busaccess.addr;
+
+	// Lock buffer mutex for thread safety
+	pthread_mutex_lock(&buffer_mutex);
+
+	if (write_addr >= buffer_base_addr &&
+	    write_addr < buffer_base_addr + buffer_size) {
+		// Calculate offset into our buffer
+		uint64_t offset = write_addr - buffer_base_addr;
+
+		// Check if requested length would go beyond buffer end
+		if (offset + len > buffer_size) {
+			printf("Warning: Write extends beyond buffer end. Truncating.\n");
+			len = buffer_size - offset;
+		}
+
+		// Update our buffer
+		memcpy(memory_buffer + offset, data, len);
+		printf("Buffer updated at offset 0x%lx, length %zu\n", offset,
+		       len);
+
+	} else {
+		// Address out of range
+		printf("Warning: Write address 0x%lx is outside buffer range (0x%lx-0x%lx)\n",
+		       write_addr, buffer_base_addr,
+		       buffer_base_addr + buffer_size - 1);
+		write_result = RP_RESP_ADDR_ERROR;
+	}
+
+	// Unlock buffer mutex
+	pthread_mutex_unlock(&buffer_mutex);
 
 	// If not posted, send a response
 	if (!(pkt->hdr.flags & RP_PKT_FLAGS_posted)) {
@@ -385,7 +546,7 @@ void handle_write(int client_fd, struct rp_pkt *pkt, uint8_t *data, size_t len)
 
 		rp_encode_busaccess_in_rsp_init(&in, pkt);
 		in.clk = timestamp;
-		in.attr |= RP_RESP_OK << RP_BUS_RESP_SHIFT;
+		in.attr |= write_result << RP_BUS_RESP_SHIFT;
 
 		rp_dpkt_alloc(&dpkt, sizeof(struct rp_pkt_busaccess_ext_base));
 		plen = rp_encode_busaccess(&peer_state,
@@ -581,13 +742,170 @@ void *client_handler(void *arg)
 	return NULL;
 }
 
+// Send a write to all connected clients
+void send_write_to_clients(uint64_t addr, uint8_t *data, size_t len)
+{
+	int clients_sent = 0;
+	struct timespec ts;
+	int64_t timestamp;
+
+	// Get current timestamp
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	timestamp = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+	// Update our internal buffer first if address is in range
+	pthread_mutex_lock(&buffer_mutex);
+	if (addr >= buffer_base_addr && addr < buffer_base_addr + buffer_size) {
+		uint64_t offset = addr - buffer_base_addr;
+		if (offset + len <= buffer_size) {
+			memcpy(memory_buffer + offset, data, len);
+			printf("Local buffer updated at offset 0x%lx\n",
+			       offset);
+		} else {
+			printf("Warning: Write extends beyond buffer end, truncating\n");
+			memcpy(memory_buffer + offset, data,
+			       buffer_size - offset);
+		}
+	} else {
+		printf("Warning: Write address 0x%lx outside buffer range\n",
+		       addr);
+	}
+	pthread_mutex_unlock(&buffer_mutex);
+
+	// Send to all connected clients
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		if (clients[i].connected) {
+			RemotePortDynPkt dpkt = { 0 };
+			size_t plen;
+			struct rp_encode_busaccess_in in = { 0 };
+
+			in.cmd = RP_CMD_write;
+			in.id = get_next_id();
+			in.dev = clients[i].dev_id;
+			in.clk = timestamp;
+			in.master_id =
+				1; // Using 1 as a default master ID for manual writes
+			in.addr = addr;
+			in.attr = 0; // No special attributes
+			in.size = len;
+			in.width = len; // Using size as width for simplicity
+			in.stream_width = len;
+
+			rp_dpkt_alloc(&dpkt,
+				      sizeof(struct rp_pkt_busaccess_ext_base));
+			plen = rp_encode_busaccess(
+				&clients[i].peer, &dpkt.pkt->busaccess_ext_base,
+				&in);
+
+			// Send the packet header
+			if (rp_safe_write(clients[i].fd, dpkt.pkt, plen) !=
+			    plen) {
+				perror("Failed to write packet header to client");
+				rp_dpkt_free(&dpkt);
+				continue;
+			}
+
+			// Send the data
+			if (rp_safe_write(clients[i].fd, data, len) !=
+			    (ssize_t)len) {
+				perror("Failed to write data to client");
+			} else {
+				clients_sent++;
+			}
+
+			rp_dpkt_free(&dpkt);
+		}
+	}
+
+	if (clients_sent > 0) {
+		printf("Sent write to %d clients (addr=0x%lx, len=%zu)\n",
+		       clients_sent, addr, len);
+	} else {
+		printf("No clients connected to receive write\n");
+	}
+}
+
+// Function to collect input for a manual write
+void handle_manual_write()
+{
+	char input_buffer[1024] = { 0 };
+	uint8_t data_buffer[BUFFER_SIZE] = { 0 };
+	size_t data_len = 0;
+	uint64_t addr = buffer_base_addr; // Default to buffer base address
+
+	// Switch back to canonical mode for input
+	struct termios old_term = orig_termios;
+	struct termios new_term = orig_termios;
+	new_term.c_lflag |= ICANON | ECHO;
+	tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
+
+	// Clear any pending input
+	int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+	fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
+
+	// Prompt for address
+	printf("\nEnter write address (hex, default=0x%lx): 0x",
+	       buffer_base_addr);
+	fflush(stdout);
+
+	if (fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
+		// Remove newline
+		size_t len = strlen(input_buffer);
+		if (len > 0 && input_buffer[len - 1] == '\n') {
+			input_buffer[len - 1] = '\0';
+		}
+
+		// Parse address if provided
+		if (strlen(input_buffer) > 0) {
+			addr = parse_hex_arg(input_buffer);
+		}
+	}
+
+	// Prompt for data
+	printf("Enter data to write (ASCII text, press Enter to send): ");
+	fflush(stdout);
+
+	if (fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
+		// Remove newline
+		size_t len = strlen(input_buffer);
+		if (len > 0 && input_buffer[len - 1] == '\n') {
+			input_buffer[len - 1] = '\0';
+			len--;
+		}
+
+		// Copy input as ASCII data
+		data_len = (len > BUFFER_SIZE) ? BUFFER_SIZE : len;
+		memcpy(data_buffer, input_buffer, data_len);
+
+		// Display what we're sending
+		printf("Writing %zu bytes to address 0x%lx:\n", data_len, addr);
+		printf("ASCII: %s\n", input_buffer);
+		printf("HEX:   ");
+		for (size_t i = 0; i < data_len; i++) {
+			printf("%02x ", data_buffer[i]);
+		}
+		printf("\n");
+
+		// Send the write
+		send_write_to_clients(addr, data_buffer, data_len);
+	}
+
+	// Restore terminal settings
+	tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+	fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+
+	printf("Write operation completed.\n");
+}
+
 // Keyboard monitoring thread function
 void *keyboard_monitor_thread(void *arg)
 {
 	char c;
 
-	printf("Keyboard monitor started. Press 'i' to send an interrupt to all clients.\n");
-	printf("Press 'q' to quit.\n");
+	printf("Keyboard monitor started. Commands:\n");
+	printf("  'i' - Send an interrupt to all clients\n");
+	printf("  'w' - Send a write to all clients\n");
+	printf("  'q' - Quit\n");
 
 	while (keyboard_monitoring) {
 		// Check for key press
@@ -597,6 +915,12 @@ void *keyboard_monitor_thread(void *arg)
 			case 'I':
 				// Send interrupt with line 1, vector 0, value 1
 				send_interrupt_to_clients(1, 0, 1);
+				break;
+
+			case 'w':
+			case 'W':
+				// Handle manual write
+				handle_manual_write();
 				break;
 
 			case 'q':
@@ -705,13 +1029,59 @@ int setup_unix_server(const char *socket_path)
 	return fd;
 }
 
+// Parse the fill range argument (min:max)
+void parse_fill_range(const char *arg)
+{
+	const char *colon_pos = strchr(arg, ':');
+	if (!colon_pos) {
+		fprintf(stderr,
+			"Invalid fill range format. Use min:max (e.g., 0x00:0xFF)\n");
+		exit(1);
+	}
+
+	// Split the string at the colon
+	char min_str[32] = { 0 };
+	char max_str[32] = { 0 };
+
+	strncpy(min_str, arg, colon_pos - arg);
+	strncpy(max_str, colon_pos + 1, sizeof(max_str) - 1);
+
+	// Parse the min and max values
+	fill_min = parse_hex_arg(min_str);
+	fill_max = parse_hex_arg(max_str);
+
+	if (fill_min > fill_max) {
+		fprintf(stderr,
+			"Fill min (0x%04x) must be less than or equal to max (0x%04x)\n",
+			fill_min, fill_max);
+		exit(1);
+	}
+
+	custom_fill = 1;
+}
+
 // Display usage information
 void print_usage(const char *program)
 {
-	fprintf(stderr, "Usage: %s <port|unix-socket-path> [--unix]\n",
+	fprintf(stderr, "Usage: %s <port|unix-socket-path> [options]\n",
 		program);
 	fprintf(stderr, "Options:\n");
-	fprintf(stderr, "  --unix    Use Unix domain socket instead of TCP\n");
+	fprintf(stderr,
+		"  --unix               Use Unix domain socket instead of TCP\n");
+	fprintf(stderr,
+		"  --base <addr>        Set buffer base address (hex, default: 0x%x)\n",
+		DEFAULT_BUFFER_BASE);
+	fprintf(stderr,
+		"  --size <size>        Set buffer size (hex/dec, default: 0x%x)\n",
+		DEFAULT_BUFFER_SIZE);
+	fprintf(stderr,
+		"  --fill <min>:<max>   Set buffer fill range (hex, default: incrementing 0x00-0xFF)\n");
+	fprintf(stderr, "\nCommands during execution:\n");
+	fprintf(stderr,
+		"  i                    Send interrupt to all clients\n");
+	fprintf(stderr,
+		"  w                    Write data to the buffer and broadcast to clients\n");
+	fprintf(stderr, "  q                    Quit the application\n");
 }
 
 int main(int argc, char *argv[])
@@ -736,19 +1106,40 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	// Check if using unix socket
-	if (argc > 2 && strcmp(argv[2], "--unix") == 0) {
-		using_unix_socket = 1;
+	// First argument is port or socket path
+	port = atoi(argv[1]);
+	if (port <= 0) {
+		// Not a valid port, assume it's a socket path for later
 		socket_path = argv[1];
-		strncpy(unix_socket_path, socket_path,
-			sizeof(unix_socket_path) - 1);
-	} else {
-		port = atoi(argv[1]);
-		if (port <= 0) {
-			fprintf(stderr, "Invalid port: %s\n", argv[1]);
+	}
+
+	// Process other optional arguments
+	for (int i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--unix") == 0) {
+			using_unix_socket = 1;
+			strncpy(unix_socket_path, socket_path,
+				sizeof(unix_socket_path) - 1);
+		} else if (strcmp(argv[i], "--base") == 0 && i + 1 < argc) {
+			buffer_base_addr = parse_hex_arg(argv[++i]);
+		} else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
+			buffer_size = parse_hex_arg(argv[++i]);
+			if (buffer_size == 0) {
+				buffer_size = DEFAULT_BUFFER_SIZE;
+				fprintf(stderr,
+					"Invalid buffer size, using default: 0x%zx\n",
+					buffer_size);
+			}
+		} else if (strcmp(argv[i], "--fill") == 0 && i + 1 < argc) {
+			parse_fill_range(argv[++i]);
+		} else {
+			fprintf(stderr, "Unknown option: %s\n", argv[i]);
+			print_usage(argv[0]);
 			return 1;
 		}
 	}
+
+	// Initialize the memory buffer
+	init_memory_buffer();
 
 	// Set terminal to raw mode for keyboard input
 	set_raw_mode();
@@ -765,6 +1156,7 @@ int main(int argc, char *argv[])
 			   NULL) != 0) {
 		perror("Failed to create keyboard monitoring thread");
 		restore_terminal();
+		cleanup_memory_buffer();
 		return 1;
 	}
 
@@ -784,11 +1176,14 @@ int main(int argc, char *argv[])
 
 	if (server_fd < 0) {
 		fprintf(stderr, "Failed to set up server\n");
+		cleanup_memory_buffer();
 		return 1;
 	}
 
 	printf("Remote-Port server listening...\n");
-	printf("Press 'i' to send an interrupt to all clients. Press 'q' to quit.\n");
+	printf("Memory buffer: base=0x%lx, size=0x%zx\n", buffer_base_addr,
+	       buffer_size);
+	printf("Commands: 'i'=send interrupt, 'w'=write data, 'q'=quit\n");
 
 	// Main server loop
 	while (keyboard_monitoring) {
@@ -886,6 +1281,9 @@ int main(int argc, char *argv[])
 			clients[i].connected = 0;
 		}
 	}
+
+	// Clean up memory buffer
+	cleanup_memory_buffer();
 
 	// Remove unix socket file if we were using one
 	if (using_unix_socket && unix_socket_path[0] != '\0') {
